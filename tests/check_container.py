@@ -33,6 +33,30 @@ def import_profile(container):
     return dict(import_time_rows=rows[-200:], import_profile_truncated=len(rows) > 200 or len(lines) >= 1000)
 
 
+def cold_import_probe(container):
+    code = ("import json, time; started = time.monotonic(); "
+            "from ortools.sat.python import cp_model; "
+            "print(json.dumps(dict(completed=True, elapsed_seconds=round(time.monotonic()-started, 3))), flush=True)")
+    try:
+        # A nonempty PYTHONPROFILEIMPORTTIME=0 still profiles; -E disables it.
+        result = subprocess.run(["docker", "exec", "--env", "PYTHONPROFILEIMPORTTIME=0", container,
+                                 "python", "-E", "-B", "-c", code],
+                                text=True, capture_output=True, timeout=60, check=True)
+        if len(result.stdout) > 256:
+            raise ValueError("invalid_probe_output")
+        value = json.loads(result.stdout)
+        if (type(value) is not dict or set(value) != {"completed", "elapsed_seconds"}
+                or value["completed"] is not True or type(value["elapsed_seconds"]) not in (int, float)
+                or not 0 <= value["elapsed_seconds"] <= 60):
+            raise ValueError("invalid_probe_output")
+        return dict(status="complete", completed=True, elapsed_seconds=value["elapsed_seconds"])
+    except subprocess.TimeoutExpired:
+        # The exec child may outlive its client; owned-container removal follows.
+        return dict(status="timeout", completed=False, elapsed_seconds=None)
+    except Exception:
+        return dict(status="error", completed=False, elapsed_seconds=None)
+
+
 def main(image, profile_imports=False):
     owner = uuid.uuid4().hex
     name = "scheduler-check-" + owner[:12]
@@ -126,6 +150,8 @@ def main(image, profile_imports=False):
                         report.update(import_profile(container["Id"]))
                     except Exception:
                         report["import_profile"] = "unavailable"
+                    if failed and report.get("checked") is False:
+                        report["cold_import_probe"] = cold_import_probe(container["Id"])
                 # Remove the inspected immutable ID, never a potentially reused name.
                 docker("rm", "--force", container["Id"])
             elif "No such container" not in inspected.stderr:
