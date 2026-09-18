@@ -3,10 +3,6 @@ name: Publish reviewed image
 # Manual publication only. Review the selected commit before dispatching.
 on:
   workflow_dispatch:
-  # Temporary registration probe. Remove after GitHub indexes this workflow.
-  push:
-    branches: [pm/native-release]
-    paths: [.github/workflows/image.yml]
 
 permissions:
   contents: read

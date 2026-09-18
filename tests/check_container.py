@@ -12,16 +12,17 @@ def docker(*args):
 
 
 def main(image):
-    name = "scheduler-check-" + uuid.uuid4().hex[:12]
-    created = False
+    owner = uuid.uuid4().hex
+    name = "scheduler-check-" + owner[:12]
+    label = "dev.prateekmulye.scheduler-qa"
     headers = {"Host": "scheduler.prateekmulye.dev", "Origin": "https://scheduler.prateekmulye.dev"}
     report = {"image": image, "cpu": 0.1, "memory_bytes": 268435456, "model_calls": 0}
     try:
         docker("run", "-d", "--pull=never", "--name", name, "--memory=256m",
+               "--label", label + "=" + owner,
                "--memory-swap=256m", "--cpus=0.1", "--pids-limit=128",
                "--security-opt=no-new-privileges", "--publish", "127.0.0.1::8080",
                "--env", "AI_GATEWAY_SECRET=" + "unused_test_credential_" + "a" * 43, image)
-        created = True
         config = json.loads(docker("inspect", name))[0]
         port = int(config["NetworkSettings"]["Ports"]["8080/tcp"][0]["HostPort"])
         report["image_id"] = config["Image"]
@@ -80,10 +81,24 @@ def main(image):
         assert report["peak_memory_bytes"] <= report["memory_bytes"]
         assert request("GET", "/health")["status"] == "ok"
         report["passed"] = True
-        print(json.dumps(report, sort_keys=True), flush=True)
     finally:
-        if created:
-            docker("rm", "--force", name)
+        failed = sys.exc_info()[0] is not None
+        try:
+            inspected = subprocess.run(["docker", "container", "inspect", name],
+                                       text=True, capture_output=True, timeout=25)
+            if inspected.returncode == 0:
+                container = json.loads(inspected.stdout)[0]
+                if (container["Config"].get("Labels") or {}).get(label) != owner:
+                    raise RuntimeError("cleanup_owner_mismatch")
+                # Remove the inspected immutable ID, never a potentially reused name.
+                docker("rm", "--force", container["Id"])
+            elif "No such container" not in inspected.stderr:
+                raise RuntimeError("cleanup_inspect_failed")
+        except Exception:
+            if not failed:
+                raise
+            print("Owned-container cleanup could not be verified; preserving original failure.", file=sys.stderr)
+    print(json.dumps(report, sort_keys=True), flush=True)
 
 
 if __name__ == "__main__":
