@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "source": {
+    "kind": "synthetic",
+    "reference": "Independently authored scheduling acceptance example",
+    "rights_note": "Synthetic data authored for this project. No employer data."
+  },
+  "horizon": 120,
+  "resources": [
+    {
+      "id": "M",
+      "availability": [
+        [
+          0,
+          120
+        ]
+      ]
+    }
+  ],
+  "orders": [
+    {
+      "id": "A",
+      "release": 0,
+      "due": 60,
+      "deadline": 60,
+      "operations": [
+        {
+          "id": "A1",
+          "resource_id": "M",
+          "duration": 60
+        }
+      ]
+    },
+    {
+      "id": "B",
+      "release": 0,
+      "due": 60,
+      "deadline": 60,
+      "operations": [
+        {
+          "id": "B1",
+          "resource_id": "M",
+          "duration": 60
+        }
+      ]
+    }
+  ]
+}

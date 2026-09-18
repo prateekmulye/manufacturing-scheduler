@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="referrer" content="same-origin">
+  <title>Manufacturing Scheduler · Manufacturing planning workbench</title>
+  <link rel="icon" href="/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to planning inputs</a>
+  <header class="masthead">
+    <a class="brand" href="#main"><img src="/logo.svg" width="36" height="36" alt=""><span>Manufacturing Scheduler<small>Manufacturing planning workbench</small></span></a>
+    <nav aria-label="Workbench"><a href="#inputs">Inputs</a><a href="#rules">Rule changes</a><a href="#schedule">Schedule</a><a href="#export">Export</a></nav>
+  </header>
+  <main id="main">
+    <div class="intro"><p class="eyebrow">Initial scheduling / one scenario</p><h1>Make room<br>for the work.</h1><p class="lede">Compare an initial schedule against your current rules. Inspect the trade-offs before accepting a planning proposal.</p></div>
+    <aside id="session-note" class="session-note"><strong>Session only.</strong> Download your work before closing or reloading. Service and AI processing details load below before inputs can be submitted. Use non-sensitive planning data.</aside>
+    <div class="connection"><span id="connection">Connecting to planning service…</span><button id="reconnect" class="quiet">Retry connection</button></div>
+    <p id="notice" class="notice" role="status" aria-live="polite"></p>
+    <div id="errors" class="errors" tabindex="-1" hidden></div>
+    <noscript><p class="errors">JavaScript is required for this planning workbench. No data is sent while it is disabled.</p></noscript>
+
+    <section id="inputs" aria-labelledby="inputs-title">
+      <div class="section-heading"><span class="section-number">01</span><div><h2 id="inputs-title">Planning inputs</h2><p>Whole minutes from scenario start. No dates, shifts or capacity inferred.</p></div><span id="revision" class="tag">No scenario</span></div>
+      <div class="load-strip"><label>Bundled synthetic example<select id="example"><option value="">Choose an example</option></select></label><button id="load-example">Load example</button><label class="file-label">Import JSON<input id="import-file" type="file" accept=".json,application/json"></label><button id="start" class="quiet">Start a scenario</button></div>
+      <div id="empty" class="empty"><span class="empty-mark" aria-hidden="true">▤</span><h3>Start with orders and available time.</h3><p>Load an example to inspect the full workflow, or bring an independently authored scenario. Maximum 20 orders, 60 operations and 10 resources.</p></div>
+      <div id="editor" hidden>
+        <div id="summary" class="summary-strip"></div>
+        <details id="edit-details" open><summary>Edit scenario <span id="draft-state">Not yet validated</span></summary><form id="input-form" novalidate><div id="structured-editor"></div><div class="action-row"><button type="submit" id="validate" class="primary">Validate and use inputs</button><button type="button" id="discard">Discard edits</button><span id="edit-hint" class="muted">Validation does not start a solve.</span></div></form></details>
+        <details id="json-details"><summary>JSON editor and format</summary><p>Version 1 scenario JSON or an exported proposal. Only inputs are restored. Imported schedules and decisions are never trusted.</p><label for="json-editor">Scenario JSON, maximum 1 MiB</label><textarea id="json-editor" class="code" rows="14" spellcheck="false"></textarea><div class="action-row"><button id="use-json">Validate and use JSON</button><button id="refresh-json" class="quiet">Restore JSON from editor</button></div></details>
+      </div>
+    </section>
+
+    <section id="rules" aria-labelledby="rules-title">
+      <div class="section-heading"><span class="section-number">02</span><div><h2 id="rules-title">Review a rule change</h2><p>Every change needs your approval. Solving stays a separate step.</p></div></div>
+      <p id="rules-empty" class="muted">Validate a scenario to change its rules.</p>
+      <div id="rule-workspace" hidden>
+        <details><summary>Change a rule with structured controls</summary><form id="manual-form" class="fields"><label>Rule<select id="rule-type"><option value="set_due">Due minute (soft)</option><option value="set_release">Release minute (hard)</option><option value="set_deadline">Deadline minute (hard)</option><option value="block_resource">Resource closure (hard)</option></select></label><label>Target ID<select id="rule-target"></select></label><label><span id="rule-minute-label">Minute</span><input id="rule-minute" type="number" min="0" step="1" required></label><label id="rule-end-label" hidden>End minute<input id="rule-end" type="number" min="0" step="1"></label><label id="remove-deadline-label" class="checkbox" hidden><input id="remove-deadline" type="checkbox"> Remove deadline</label><button type="submit">Review change</button></form></details>
+        <details id="ai-details"><summary>Describe a rule change <span class="tag">Optional AI</span></summary><p id="model-state" class="muted">Model availability not checked.</p><p>Use exact IDs and minute values. For example: “Block M from minute 0 to minute 60.” Requests for priorities, staffing or materials are unsupported.</p><form id="ai-form"><label for="request">Planning request</label><textarea id="request" rows="3" maxlength="2000" required></textarea><div class="action-row"><button id="propose" type="submit">Propose changes</button><span id="ai-progress" class="muted"></span></div></form></details>
+        <div id="proposal" hidden></div>
+      </div>
+    </section>
+
+    <section id="schedule" aria-labelledby="schedule-title">
+      <div class="section-heading"><span class="section-number">03</span><div><h2 id="schedule-title">Compare the schedule</h2><p>Minimize total tardiness, then latest completion. Search budget: 10 seconds.</p></div></div>
+      <div class="action-row solve-row"><button id="solve" class="primary" disabled>Solve schedule</button><button id="cancel" hidden>Cancel solve</button><span id="solve-state" role="status">Validate inputs to begin.</span><span id="elapsed" aria-hidden="true"></span></div>
+      <div id="results" hidden><p id="result-notice" class="notice"></p><div id="comparison" class="comparison"></div><p id="delta" class="delta"></p><div class="view-heading"><h3>Resource schedule</h3><label>Show<select id="schedule-view"><option value="candidate">Scheduling result</option><option value="baseline">Serial baseline</option></select></label></div><p class="muted">Minutes from scenario start. Hatched areas are unavailable. Exact assignments follow the timeline.</p><div id="timeline" class="table-scroll" tabindex="0" role="region" aria-label="Resource timeline"></div><div id="assignments" class="table-scroll" tabindex="0" role="region" aria-label="Operation assignments"></div><div id="outcomes" class="table-scroll" tabindex="0" role="region" aria-label="Order outcomes"></div><details><summary>Engine and input evidence</summary><pre id="technical" class="code"></pre></details><div class="action-row"><button id="explain">Explain checked facts with AI</button><span id="explain-state" class="muted"></span></div><div id="explanation"></div></div>
+    </section>
+
+    <section id="export" aria-labelledby="export-title">
+      <div class="section-heading"><span class="section-number">04</span><div><h2 id="export-title">Your planning decision</h2><p>Acceptance records a proposal. No work is dispatched or sent to an ERP.</p></div></div>
+      <p id="decision" class="decision">No checked proposal to review.</p><div class="action-row"><button id="accept" class="primary" disabled>Accept planning proposal</button><button id="reject" disabled>Reject planning proposal</button></div><div class="action-row export-row"><button id="download-proposal" disabled>Download proposal JSON</button><button id="download-input" disabled>Download inputs JSON</button><button id="reset" class="quiet">Reset session</button></div>
+    </section>
+    <footer><p>Independently authored scheduling workbench. Bundled examples are synthetic. No live SAP, MES or factory connection.</p><p>Human review · No accounts · No automatic saving</p></footer>
+  </main>
+  <dialog id="confirm-dialog"><form method="dialog"><h2 id="confirm-title">Replace current work?</h2><p id="confirm-copy">Download first to keep a copy.</p><div class="action-row"><button value="cancel" autofocus>Keep current work</button><button value="confirm" class="primary">Continue</button></div></form></dialog>
+</body>
+</html>

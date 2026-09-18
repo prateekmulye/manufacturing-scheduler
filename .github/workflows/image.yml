@@ -1,0 +1,59 @@
+name: Publish reviewed image
+
+# Manual publication only. Review the selected commit before dispatching.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ghcr-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'prateekmulye/manufacturing-scheduler' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      IMAGE: ghcr.io/prateekmulye/manufacturing-scheduler
+    steps:
+      - name: Check out selected commit
+        # actions/checkout v6.1.0; verified against the official repository tag.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+
+      - name: Build native Linux image
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          docker build --platform linux/amd64 \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$IMAGE:$GITHUB_SHA" .
+
+      - name: Verify useful scheduling under free service limits
+        shell: bash
+        run: python3 -B tests/check_container.py "$IMAGE:$GITHUB_SHA"
+
+      - name: Publish commit tag and report immutable digest
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          export DOCKER_CONFIG
+          DOCKER_CONFIG=$(mktemp -d "$RUNNER_TEMP/ghcr.XXXXXX")
+          trap 'rm -rf -- "$DOCKER_CONFIG"' EXIT
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          unset GHCR_TOKEN
+          docker push "$IMAGE:$GITHUB_SHA"
+          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$GITHUB_SHA")
+          [[ "$digest" == "$IMAGE"@sha256:* ]]
+          [[ "${digest##*@sha256:}" =~ ^[0-9a-f]{64}$ ]]
+          printf 'Published %s\n' "$digest"
+          printf 'Image: `%s`\n\nCommit: `%s`\n' "$digest" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"

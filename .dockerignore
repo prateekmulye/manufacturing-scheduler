@@ -1,0 +1,14 @@
+*
+!Dockerfile
+!requirements.txt
+!ai.py
+!hosted.py
+!scheduler.py
+!server.py
+!static/
+!static/**
+!examples/
+!examples/**
+!deploy/
+!deploy/**
+static/*.check.mjs
