@@ -11,12 +11,18 @@ def docker(*args):
     return subprocess.check_output(["docker", *args], text=True, timeout=25).strip()
 
 
+def resource_usage(container):
+    peak = int(docker("exec", container, "cat", "/sys/fs/cgroup/memory.peak"))
+    events = dict(line.split() for line in docker("exec", container, "cat", "/sys/fs/cgroup/memory.events").splitlines())
+    return dict(peak_memory_bytes=peak, oom=int(events["oom"]), oom_kill=int(events["oom_kill"]))
+
+
 def main(image):
     owner = uuid.uuid4().hex
     name = "scheduler-check-" + owner[:12]
     label = "dev.prateekmulye.scheduler-qa"
     headers = {"Host": "scheduler.prateekmulye.dev", "Origin": "https://scheduler.prateekmulye.dev"}
-    report = {"image": image, "cpu": 0.1, "memory_bytes": 268435456, "model_calls": 0}
+    report = {"image": image, "cpu": 0.1, "memory_bytes": 268435456, "model_calls": 0, "passed": False}
     try:
         docker("run", "-d", "--pull=never", "--name", name, "--memory=256m",
                "--label", label + "=" + owner,
@@ -70,14 +76,15 @@ def main(image):
             assert time.monotonic() - started < 20, "solver_did_not_finish"
             time.sleep(0.2)
         candidate = result["candidate"]
+        report.update(solve_seconds=round(time.monotonic() - started, 3),
+                      job_elapsed_ms=result["elapsed_ms"], checked=candidate["checked"],
+                      status=candidate["status"], reason=candidate["reason"])
         assert time.monotonic() - started < 20, "solver_did_not_finish"
         assert candidate["checked"] and candidate["status"] in ("optimal", "feasible")
         assert candidate["metrics"]["total_tardiness"] == 0
-        report.update(solve_seconds=round(time.monotonic() - started, 3),
-                      status=candidate["status"], metrics=candidate["metrics"])
-        report["peak_memory_bytes"] = int(docker("exec", name, "cat", "/sys/fs/cgroup/memory.peak"))
-        events = dict(line.split() for line in docker("exec", name, "cat", "/sys/fs/cgroup/memory.events").splitlines())
-        assert int(events["oom"]) == int(events["oom_kill"]) == 0
+        report["metrics"] = candidate["metrics"]
+        report.update(resource_usage(name))
+        assert report["oom"] == report["oom_kill"] == 0
         assert report["peak_memory_bytes"] <= report["memory_bytes"]
         assert request("GET", "/health")["status"] == "ok"
         report["passed"] = True
@@ -90,15 +97,22 @@ def main(image):
                 container = json.loads(inspected.stdout)[0]
                 if (container["Config"].get("Labels") or {}).get(label) != owner:
                     raise RuntimeError("cleanup_owner_mismatch")
+                if failed and "oom_kill" not in report:
+                    try:
+                        report.update(resource_usage(container["Id"]))
+                    except Exception:
+                        report["resource_diagnostics"] = "unavailable"
                 # Remove the inspected immutable ID, never a potentially reused name.
                 docker("rm", "--force", container["Id"])
             elif "No such container" not in inspected.stderr:
                 raise RuntimeError("cleanup_inspect_failed")
         except Exception:
+            report["passed"] = False
             if not failed:
                 raise
             print("Owned-container cleanup could not be verified; preserving original failure.", file=sys.stderr)
-    print(json.dumps(report, sort_keys=True), flush=True)
+        finally:
+            print(json.dumps(report, sort_keys=True), flush=True)
 
 
 if __name__ == "__main__":
