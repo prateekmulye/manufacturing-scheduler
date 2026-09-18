@@ -110,22 +110,29 @@ def main(image, profile_imports=False):
         scenario = request("GET", "/examples/comparison.json")
         payload = {"session_id": session["session_id"], "revision": 1, "input": scenario}
         request("POST", "/api/validate", payload)
-        started = time.monotonic()
-        job = request("POST", "/api/solve", payload, expected=202)
-        while True:
-            result = request("GET", "/api/jobs/" + job["job_id"])
-            if result["state"] == "complete":
-                break
-            assert time.monotonic() - started < 20, "solver_did_not_finish"
-            time.sleep(0.2)
-        candidate = result["candidate"]
-        report.update(solve_seconds=round(time.monotonic() - started, 3),
-                      job_elapsed_ms=result["elapsed_ms"], checked=candidate["checked"],
-                      status=candidate["status"], reason=candidate["reason"])
-        assert time.monotonic() - started < 20, "solver_did_not_finish"
-        assert candidate["checked"] and candidate["status"] in ("optimal", "feasible")
-        assert candidate["metrics"]["total_tardiness"] == 0
-        report["metrics"] = candidate["metrics"]
+        report["solves"] = []
+        for attempt in ("initial", "followup"):
+            report["attempt"] = attempt
+            for key in ("checked", "status", "reason", "job_elapsed_ms", "solve_seconds", "metrics"):
+                report.pop(key, None)
+            started = time.monotonic()
+            job = request("POST", "/api/solve", payload, expected=202)
+            while True:
+                result = request("GET", "/api/jobs/" + job["job_id"])
+                if result["state"] == "complete":
+                    break
+                assert time.monotonic() - started < 45, "solver_did_not_finish"
+                time.sleep(0.2)
+            candidate = result["candidate"]
+            summary = dict(attempt=attempt, solve_seconds=round(time.monotonic() - started, 3),
+                           job_elapsed_ms=result["elapsed_ms"], checked=candidate["checked"],
+                           status=candidate["status"], reason=candidate["reason"])
+            report["solves"].append(summary)
+            report.update(summary)
+            assert time.monotonic() - started < 45, "solver_did_not_finish"
+            assert candidate["checked"] and candidate["status"] in ("optimal", "feasible")
+            assert candidate["metrics"]["total_tardiness"] == 0
+            summary["metrics"] = report["metrics"] = candidate["metrics"]
         report.update(resource_usage(name))
         assert report["oom"] == report["oom_kill"] == 0
         assert report["peak_memory_bytes"] <= report["memory_bytes"]

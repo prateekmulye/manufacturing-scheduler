@@ -3,7 +3,7 @@
 const $ = id => document.getElementById(id);
 const clone = value => structuredClone(value);
 const same = (a, b) => Boolean(a && b && a.session_id === b.session_id && a.revision === b.revision && a.input_hash === b.input_hash);
-const state = {config:null, current:null, draft:null, tuple:null, revision:0, dirty:false, jsonDirty:false, epoch:0, job:null, solving:false, validating:false, aiBusy:false, result:null, proposal:null, diffs:[], decision:{state:'unreviewed',result_hash:null}, clock:null};
+const state = {config:null, current:null, draft:null, tuple:null, revision:0, dirty:false, jsonDirty:false, epoch:0, job:null, solving:false, validating:false, aiBusy:false, result:null, proposal:null, diffs:[], decision:{state:'unreviewed',result_hash:null}, clock:null, solveNotice:null};
 const errors = {integer_bounds:'Use a whole minute within the scenario horizon.',id:'Use 1–64 letters, numbers, underscores, dots or hyphens.',duplicate:'This ID is already in use.',unknown_resource:'Choose an existing resource.',calendar_order:'Enter sorted, nonoverlapping intervals with start before end.',count:'Check the number of entries against the stated limits.',fields:'Required fields are missing or unsupported fields are present.',version:'Use scenario version 1.',text:'Enter 1–512 characters on one line.',invalid_json:'JSON could not be read. Check brackets, commas and quoted names.',duplicate_key:'JSON contains a repeated property name.',size:'Input exceeds 1 MiB.',busy:'Compute is busy. Retry when the current request finishes.',stale:'Inputs changed. Review the current revision and try again.',forbidden:'Session could not be verified. Reconnect, then validate inputs.',not_found:'Result expired from the service. Solve again.',unavailable:'Service or model unavailable. Manual inputs remain here.',timeout:'Request reached its time limit. Inputs remain here.'};
 
 function el(tag, attrs={}, ...children) {
@@ -41,8 +41,8 @@ function fail(error) {
   $('errors').replaceChildren(el('h3',{},'Check this before continuing'),el('p',{},message),list);
   $('errors').hidden = false; $('errors').focus();
 }
-async function api(path, body, method='POST') {
-  const response = await fetch(path,{method,headers:{'X-CSRF-Token':state.config?.csrf_token || '', 'X-Session-ID':state.config?.session_id || '', ...(body !== undefined ? {'Content-Type':'application/json'} : {})},...(body !== undefined ? {body:JSON.stringify(body)} : {}),cache:'no-store',signal:AbortSignal.timeout(55000)});
+async function api(path, body, method='POST', timeout=55000) {
+  const response = await fetch(path,{method,headers:{'X-CSRF-Token':state.config?.csrf_token || '', 'X-Session-ID':state.config?.session_id || '', ...(body !== undefined ? {'Content-Type':'application/json'} : {})},...(body !== undefined ? {body:JSON.stringify(body)} : {}),cache:'no-store',signal:AbortSignal.timeout(timeout)});
   const data = await response.json();
   if (!response.ok) { const error = new Error(errors[data.error?.code] || `Request failed (${response.status}).`); error.detail = data.error; throw error; }
   return data;
@@ -53,13 +53,14 @@ async function confirmAction(title, copy) {
   return new Promise(resolve=>dialog.addEventListener('close',()=>resolve(dialog.returnValue === 'confirm'),{once:true}));
 }
 async function forget(job) { if (job) try { await api(`/api/jobs/${encodeURIComponent(job)}`,undefined,'DELETE'); } catch { /* Expired jobs are already forgotten. */ } }
-function cancelSolve(announce=true) {
+function cancelSolve(announce=true, notice='Cancelled. Inputs preserved.') {
   const job = state.job; state.job = null; state.solving = false; state.epoch++;
   clearInterval(state.clock); state.clock = null; $('elapsed').textContent = ''; forget(job);
+  state.solveNotice = announce ? notice : null;
   controls();
-  if (announce) $('solve-state').textContent = 'Cancelled. Inputs preserved.';
 }
 function invalidate() {
+  state.solveNotice = null;
   state.dirty = true; state.decision = {state:'unreviewed',result_hash:null};
   if (state.solving) cancelSolve(false); else state.epoch++;
   state.proposal = null; $('proposal').hidden = true; controls();
@@ -67,6 +68,7 @@ function invalidate() {
 function canPlan() { return Boolean(state.config && state.tuple && state.current && !state.dirty && !state.jsonDirty && !state.validating); }
 function canReview() { return Boolean(canPlan() && !state.solving && state.result && !state.result.superseded && same(state.result.tuple,state.tuple) && state.result.candidate?.checked && ['optimal','feasible'].includes(state.result.candidate.status)); }
 function controls() {
+  const recoverFocus = !$('cancel').hidden && document.activeElement === $('cancel');
   $('empty').hidden = Boolean(state.draft); $('editor').hidden = !state.draft;
   $('rule-workspace').hidden = !state.current; $('rules-empty').hidden = Boolean(state.current);
   $('revision').textContent = state.tuple ? `Revision ${state.tuple.revision}${state.dirty || state.jsonDirty ? ' · edits pending' : ''}` : 'No validated scenario';
@@ -85,7 +87,8 @@ function controls() {
   if (state.result) {
     $('result-notice').textContent = state.result.superseded ? 'Earlier solve retained for inspection. Complete a new solve before accepting.' : same(state.result.tuple,state.tuple) && !state.dirty && !state.jsonDirty ? `Checked against input revision ${state.result.tuple.revision}.` : `Previous revision ${state.result.tuple.revision} or pending edits. Validate and solve again before accepting.`;
   }
-  if (!state.solving) $('solve-state').textContent = state.dirty || state.jsonDirty ? 'Finish or discard input edits before solving.' : state.current ? 'Ready to solve. No work dispatched.' : 'Validate inputs to begin.';
+  if (!state.solving) $('solve-state').textContent = state.solveNotice || (state.dirty || state.jsonDirty ? 'Finish or discard input edits before solving.' : state.current ? 'Ready to solve. No work dispatched.' : 'Validate inputs to begin.');
+  if (recoverFocus && !state.solving) ($('solve').disabled ? $('schedule-title') : $('solve')).focus();
   $('decision').textContent = !canReview() ? 'No current checked proposal to review.' : state.decision.state === 'accepted' ? 'Accepted for planning. No work dispatched.' : state.decision.state === 'rejected' ? 'Rejected. Proposal remains available for inspection.' : 'Unreviewed planning proposal.';
 }
 
@@ -227,13 +230,29 @@ function renderSchedule() {
   $('outcomes').append(table('Order outcomes, minutes',['Order','Completion','Due','Tardiness'],result.metrics.orders.map(o=>[o.order_id,o.completion,input.orders.find(v=>v.id===o.order_id).due,o.tardiness])));
 }
 async function solve() {
-  if(!canPlan()||state.solving)return;clearErrors();state.solving=true;if(state.result)state.result.superseded=true;state.decision={state:'unreviewed',result_hash:null};const epoch=state.epoch,tuple=clone(state.tuple),input=clone(state.current),started=performance.now();controls();$('solve-state').textContent='Searching for a schedule…';
-  state.clock=setInterval(()=>{$('elapsed').textContent=`${((performance.now()-started)/1000).toFixed(1)} s elapsed`;},200);
+  if(!canPlan()||state.solving)return;
+  const started=performance.now();
+  clearErrors();state.solving=true;state.solveNotice=null;if(state.result)state.result.superseded=true;state.decision={state:'unreviewed',result_hash:null};
+  const epoch=state.epoch,tuple=clone(state.tuple),input=clone(state.current);
+  const retired=()=>{
+    if(epoch!==state.epoch)return true;
+    if(performance.now()-started<45000)return false;
+    cancelSolve(true,'Calculation timed out. Your inputs are unchanged. Try again.');
+    return true;
+  };
+  controls();$('solve-state').textContent='Calculating your schedule…';
+  state.clock=setInterval(()=>{if(!retired())$('elapsed').textContent=`${((performance.now()-started)/1000).toFixed(1)} s elapsed`;},200);
   try{
+    // Keep submission alive so a late acknowledgement can still identify the job to delete.
     const accepted=await api('/api/solve',{session_id:tuple.session_id,revision:tuple.revision,input});
-    if(epoch!==state.epoch||!same(accepted.tuple,tuple)){forget(accepted.job_id);return;}state.job=accepted.job_id;
-    for(;;){await new Promise(resolve=>setTimeout(resolve,300));if(epoch!==state.epoch)return;const result=await api(`/api/jobs/${encodeURIComponent(state.job)}`,undefined,'GET');if(epoch!==state.epoch||!same(tuple,state.tuple)||!same(result.tuple,tuple))return;if(result.state==='complete'){state.result={...result,input};state.job=null;renderResult();say(statusCopy[result.candidate?.status] || 'Solve finished. Inspect the result.');break;}}
-  }catch(error){if(epoch===state.epoch)fail(error);}finally{if(epoch===state.epoch){state.solving=false;clearInterval(state.clock);state.clock=null;$('elapsed').textContent='';controls();}}
+    if(retired()||!same(accepted.tuple,tuple)){forget(accepted.job_id);return;}state.job=accepted.job_id;
+    for(;;){
+      await new Promise(resolve=>setTimeout(resolve,300));if(retired())return;
+      const result=await api(`/api/jobs/${encodeURIComponent(state.job)}`,undefined,'GET',Math.max(1,Math.ceil(45000-(performance.now()-started))));
+      if(retired()||!same(tuple,state.tuple)||!same(result.tuple,tuple))return;
+      if(result.state==='complete'){state.result={...result,input};state.job=null;renderResult();say(statusCopy[result.candidate?.status] || 'Solve finished. Inspect the result.');break;}
+    }
+  }catch(error){if(!retired())fail(error);}finally{if(epoch===state.epoch){state.solving=false;clearInterval(state.clock);state.clock=null;$('elapsed').textContent='';controls();}}
 }
 async function explain() {
   if(!canReview()||state.aiBusy)return;const epoch=state.epoch,result=state.result;state.aiBusy=true;controls();$('explain-state').textContent='Selecting facts from checked evidence…';

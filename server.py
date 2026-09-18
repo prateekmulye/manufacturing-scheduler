@@ -30,11 +30,14 @@ for name, _ in EXAMPLES:
 
 
 class Jobs:
-    def __init__(self, budget=10, grace=3):
+    def __init__(self, budget=10, grace=3, startup=30):
+        for name, value, cap in (("startup", startup, 30), ("budget", budget, 10), ("grace", grace, 3)):
+            require(type(value) in (int, float) and 0 <= value <= cap and (name == "grace" or value > 0),
+                    name, "configuration")
         self.lock = threading.RLock()
         self.jobs, self.sessions, self.cookies = {}, {}, {}
         self.ai_lock = threading.Lock()
-        self.budget, self.grace = budget, grace
+        self.budget, self.grace, self.startup = budget, grace, startup
         self.context = multiprocessing.get_context("spawn")
         self.closed = threading.Event()
         self.reaper = threading.Thread(target=self._reap, daemon=True)
@@ -104,29 +107,76 @@ class Jobs:
     def _watch(self, job_id, job):
         process, connection, scenario = job["process"], job["receive"], job["input"]
         final = None
+        ready = False
+        deadline = job["created"] + self.startup
+        absolute_deadline = deadline + self.budget + self.grace
+        def expired(now=None):
+            nonlocal final
+            if (time.monotonic() if now is None else now) < deadline:
+                return False
+            incumbent = job["last_incumbent"] if ready else None
+            final = dict(status="feasible" if incumbent else "timeout_no_solution",
+                         reason="watchdog_timeout" if ready else "solver_startup_timeout",
+                         assignments=incumbent, engine=None)
+            return True
         try:
             base = baseline(scenario)
             while not job["cancelled"]:
-                if connection.poll(0.03):
+                if expired():
+                    break
+                available = connection.poll(min(0.03, max(0, deadline - time.monotonic())))
+                if job["cancelled"] or expired():
+                    break
+                if available:
                     try:
-                        message = parse_json(connection.recv_bytes(65536))
+                        raw = connection.recv_bytes(65536)
                     except EOFError:
                         break
-                    if message["kind"] == "incumbent":
+                    if job["cancelled"] or expired():
+                        break
+                    try:
+                        message = parse_json(raw)
+                    except ValidationError:
+                        raise ValidationError("solver_message", "solver_protocol") from None
+                    require(type(message) is dict and set(message) == {"kind", "value"},
+                            "solver_message", "solver_protocol")
+                    if message["kind"] == "ready":
+                        require(not ready and message["value"] is None, "solver_message", "solver_protocol")
+                        now = time.monotonic()
+                        if expired(now):
+                            break
+                        ready = True
+                        deadline = min(absolute_deadline, now + self.budget + self.grace)
+                    elif message["kind"] == "incumbent":
+                        require(ready, "solver_message", "solver_protocol")
                         check_assignments(scenario, message["value"])
+                        if job["cancelled"] or expired():
+                            break
                         job["last_incumbent"] = message["value"]
                     elif message["kind"] == "final":
-                        final = message["value"]
+                        value = message["value"]
+                        require(type(value) is dict and set(value) == {"status", "reason", "assignments", "engine"}
+                                and value["status"] in ("optimal", "feasible", "infeasible", "timeout_no_solution", "error"),
+                                "solver_message", "solver_protocol")
+                        require(ready or value == dict(status="error", reason="solver_failure", assignments=None, engine=None),
+                                "solver_message", "solver_protocol")
+                        if expired():
+                            break
+                        final = value
                         break
-                if time.monotonic() - job["created"] > self.budget + self.grace:
-                    final = dict(status="feasible" if job["last_incumbent"] else "timeout_no_solution",
-                                 reason="watchdog_timeout", assignments=job["last_incumbent"], engine=None)
-                    break
+                    else:
+                        raise ValidationError("solver_message", "solver_protocol")
                 if not process.is_alive() and not connection.poll():
                     break
             if final is None:
                 final = dict(status="error", reason="solver_exit", assignments=None, engine=None)
             result = candidate(scenario, job["tuple"], **final)
+            if expired():
+                result = candidate(scenario, job["tuple"], **final)
+        except ValidationError as error:
+            base = None
+            result = candidate(scenario, job["tuple"], "error",
+                               "solver_protocol" if error.code == "solver_protocol" else "invalid_assignment")
         except Exception:
             base = None
             result = candidate(scenario, job["tuple"], "error", "invalid_assignment")

@@ -1,7 +1,9 @@
 """Run: python -B -m unittest discover -s tests -v (inside this app)."""
 import copy
+from functools import partial
 import http.client
 import http.cookiejar
+import importlib.util
 import itertools
 import json
 import resource
@@ -13,7 +15,7 @@ import unittest
 import urllib.request
 import uuid
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import scheduler as s
@@ -29,14 +31,269 @@ def identity(scenario):
     return s.make_tuple(str(uuid.uuid4()), 1, scenario)
 
 
-def hung_child(scenario, connection, budget):
-    time.sleep(5)
-
-
-def incumbent_child(scenario, connection, budget):
+def barrier_child(scenario, connection, budget, entered, release, solving):
+    def send(kind, value):
+        connection.send_bytes(json.dumps(dict(kind=kind, value=value)).encode())
     rows = s.baseline(scenario)["assignments"]
-    connection.send_bytes(json.dumps(dict(kind="incumbent", value=rows)).encode())
-    time.sleep(5)
+    if solving:
+        send("ready", None)
+        send("incumbent", rows)
+    entered.set()
+    if release.wait(5):
+        send("incumbent", rows)
+        send("final", dict(status="optimal", reason=None, assignments=rows, engine=None))
+    connection.close()
+
+
+class WatchdogChecks(unittest.TestCase):
+    ready = {"kind": "ready", "value": None}
+
+    def final(self):
+        return dict(kind="final", value=dict(status="optimal", reason=None,
+                    assignments=s.baseline(example())["assignments"], engine=None))
+
+    def watch(self, events, initial=0, check_delay=None, candidate_delay=None, cancel_on_receive=False):
+        clock, script = [initial], list(events)
+        class Pipe:
+            reads = 0
+            closed = False
+            def poll(self, timeout=0):
+                if script:
+                    clock[0] = max(clock[0], script[0][0])
+                    return True
+                clock[0] += timeout
+                return False
+            def recv_bytes(self, limit):
+                _, received, message = script.pop(0)
+                clock[0] = max(clock[0], received)
+                self.reads += 1
+                if cancel_on_receive: job["cancelled"] = True
+                return json.dumps(message).encode()
+            def close(self): self.closed = True
+        pipe, process = Pipe(), Mock()
+        process.is_alive.return_value = True
+        process.terminate.side_effect = lambda: setattr(process.is_alive, "return_value", False)
+        jobs = object.__new__(server.Jobs)
+        jobs.lock = threading.RLock()
+        jobs.startup, jobs.budget, jobs.grace = 30, 10, 3
+        data = example()
+        job = dict(tuple=identity(data), state="pending", candidate=None, created=0, process=process, receive=pipe,
+                   cancelled=False, last_incumbent=None, input=data)
+        jobs.jobs = {"job": job}
+        check = server.check_assignments
+        def delayed_check(*args):
+            result = check(*args)
+            if check_delay is not None: clock[0] = check_delay
+            return result
+        candidate = server.candidate
+        def delayed_candidate(*args, **kwargs):
+            result = candidate(*args, **kwargs)
+            if result["status"] == "optimal" and candidate_delay is not None: clock[0] = candidate_delay
+            return result
+        with patch.object(server.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(server, "check_assignments", side_effect=delayed_check), \
+                patch.object(server, "candidate", side_effect=delayed_candidate):
+            jobs._watch("job", job)
+        self.assertTrue(pipe.closed)
+        process.terminate.assert_called_once()
+        process.join.assert_called()
+        return job, pipe
+
+    def test_startup_stall_has_its_own_deadline_and_cleanup(self):
+        job, pipe = self.watch([])
+        self.assertEqual((job["candidate"]["status"], job["candidate"]["reason"], job["elapsed_ms"]),
+                         ("timeout_no_solution", "solver_startup_timeout", 30000))
+        self.assertIsNone(job["candidate"]["assignments"])
+        self.assertEqual(pipe.reads, 0)
+
+    def test_delayed_ready_receives_full_solve_budget(self):
+        job, _ = self.watch([(20, 20, self.ready), (32.9, 32.9, self.final())])
+        self.assertTrue(job["candidate"]["checked"])
+        self.assertEqual((job["candidate"]["status"], job["elapsed_ms"]), ("optimal", 32900))
+
+    def test_solve_expiry_preserves_only_checked_incumbent(self):
+        rows = s.baseline(example())["assignments"]
+        for incumbent in (None, rows):
+            with self.subTest(incumbent=bool(incumbent)):
+                events = [(29, 29, self.ready)]
+                if incumbent: events.append((30, 30, dict(kind="incumbent", value=incumbent)))
+                job, _ = self.watch(events)
+                result = job["candidate"]
+                self.assertEqual(result["reason"], "watchdog_timeout")
+                self.assertEqual(result["status"], "feasible" if incumbent else "timeout_no_solution")
+                self.assertEqual(result["checked"], bool(incumbent))
+                self.assertEqual(job["elapsed_ms"], 42000)
+        invalid = copy.deepcopy(rows); invalid[1]["start"] = 0
+        job, _ = self.watch([(1, 1, self.ready), (2, 2, dict(kind="incumbent", value=invalid))])
+        self.assertFalse(job["candidate"]["checked"])
+        self.assertEqual(job["candidate"]["reason"], "invalid_assignment")
+
+    def test_expired_messages_cannot_revive_or_promote_results(self):
+        for poll, receive in ((30, 30), (29.9, 30), (31, 31)):
+            with self.subTest(ready=(poll, receive)):
+                job, _ = self.watch([(poll, receive, self.ready), (31, 31, self.final())])
+                self.assertEqual(job["candidate"]["reason"], "solver_startup_timeout")
+                self.assertFalse(job["candidate"]["checked"])
+        job, pipe = self.watch([(29, 29, self.ready)], initial=30)
+        self.assertEqual(pipe.reads, 0)
+        self.assertEqual(job["candidate"]["reason"], "solver_startup_timeout")
+        for kind in (self.final(), dict(kind="incumbent", value=s.baseline(example())["assignments"])):
+            for poll, receive in ((33, 33), (32.9, 33)):
+                with self.subTest(kind=kind["kind"], arrival=(poll, receive)):
+                    job, _ = self.watch([(20, 20, self.ready), (poll, receive, kind)])
+                    self.assertEqual(job["candidate"]["reason"], "watchdog_timeout")
+                    self.assertFalse(job["candidate"]["checked"])
+        job, _ = self.watch([(20, 20, self.ready), (32, 32, dict(kind="incumbent",
+                            value=s.baseline(example())["assignments"]))], check_delay=33)
+        self.assertFalse(job["candidate"]["checked"])
+        job, _ = self.watch([(20, 20, self.ready), (32, 32, self.final())], candidate_delay=33)
+        self.assertFalse(job["candidate"]["checked"])
+
+    def test_cancelled_watch_never_publishes_late_messages(self):
+        for message in (self.ready, self.final(), dict(kind="incumbent", value=s.baseline(example())["assignments"])):
+            with self.subTest(kind=message["kind"]):
+                job, _ = self.watch([(1, 1, message)], cancel_on_receive=True)
+                self.assertEqual(job["state"], "pending")
+                self.assertIsNone(job["candidate"])
+
+    def test_ready_protocol_is_exact_and_cannot_reset_clock(self):
+        early_error = dict(kind="final", value=dict(status="error", reason="solver_failure", assignments=None, engine=None))
+        invalid_sequences = [
+            [(1, 1, self.final())], [(1, 1, dict(kind="incumbent", value=[]))],
+            [(1, 1, dict(kind="ready", value=True))], [(1, 1, {"kind": "ready"})],
+            [(1, 1, dict(kind="ready", value=None, extra=True))],
+            [(1, 1, self.ready), (2, 2, self.ready), (3, 3, self.final())],
+            [(1, 1, dict(kind="unknown", value=None))]]
+        for events in invalid_sequences:
+            with self.subTest(events=events):
+                job, _ = self.watch(events)
+                self.assertEqual((job["candidate"]["status"], job["candidate"]["reason"]), ("error", "solver_protocol"))
+        job, _ = self.watch([(1, 1, early_error)])
+        self.assertEqual(job["candidate"]["reason"], "solver_failure")
+
+    def test_constructor_bounds_fail_before_background_work(self):
+        for key, cap in (("startup", 30), ("budget", 10), ("grace", 3)):
+            values = [True, False, None, "1", float("nan"), float("inf"), -float("inf"), -1, cap + .1]
+            if key != "grace": values.append(0)
+            for value in values:
+                with self.subTest(key=key, value=value), patch.object(server.threading, "Thread") as thread, \
+                        patch.object(server.multiprocessing, "get_context") as context:
+                    with self.assertRaises(s.ValidationError): server.Jobs(**{key: value})
+                    thread.assert_not_called(); context.assert_not_called()
+        with patch.object(server.threading, "Thread"):
+            jobs = server.Jobs(startup=.1, budget=.1, grace=0)
+            self.assertEqual((jobs.startup, jobs.budget, jobs.grace), (.1, .1, 0))
+
+    def test_child_emits_ready_once_before_model_build(self):
+        from ortools.sat.python import cp_model
+        connection, messages = Mock(), []
+        connection.send_bytes.side_effect = lambda raw: messages.append(json.loads(raw))
+        model = cp_model.CpModel
+        def build():
+            self.assertEqual(messages, [self.ready])
+            return model()
+        with patch.object(cp_model, "CpModel", side_effect=build): s.solve_child(example(), connection)
+        self.assertEqual(sum(message["kind"] == "ready" for message in messages), 1)
+        self.assertEqual(messages[-1]["kind"], "final")
+        self.assertTrue(s.candidate(example(), identity(example()), **messages[-1]["value"])["checked"])
+        connection.close.assert_called_once()
+
+    def test_child_import_failure_emits_only_early_error(self):
+        connection, messages = Mock(), []
+        connection.send_bytes.side_effect = lambda raw: messages.append(json.loads(raw))
+        original_import = __import__
+        def unavailable(name, *args, **kwargs):
+            if name == "ortools": raise ImportError("unavailable")
+            return original_import(name, *args, **kwargs)
+        with patch("builtins.__import__", side_effect=unavailable): s.solve_child(example(), connection)
+        self.assertEqual(messages, [dict(kind="final", value=dict(status="error", reason="solver_failure", assignments=None, engine=None))])
+        connection.close.assert_called_once()
+
+    def test_cancel_and_session_expiry_during_startup_and_solving(self):
+        for solving in (False, True):
+            for expire in (False, True):
+                with self.subTest(solving=solving, expire=expire):
+                    jobs = server.Jobs()
+                    entered, release = jobs.context.Event(), jobs.context.Event()
+                    checked, finished = threading.Event(), threading.Event()
+                    watch, check = jobs._watch, server.check_assignments
+                    def watched(*args):
+                        try: watch(*args)
+                        finally: finished.set()
+                    def observed(*args):
+                        value = check(*args); checked.set(); return value
+                    data = example(); sid = jobs.new_session(); value = s.make_tuple(sid, 1, data)
+                    jobs.register(value)
+                    try:
+                        with patch.object(server, "solve_child", partial(barrier_child, entered=entered, release=release, solving=solving)), \
+                                patch.object(jobs, "_watch", side_effect=watched), \
+                                patch.object(server, "check_assignments", side_effect=observed):
+                            job_id = jobs.start(data, value); job = jobs.jobs[job_id]
+                            self.assertTrue(entered.wait(5))
+                            if solving: self.assertTrue(checked.wait(5))
+                            with self.assertRaises(s.ValidationError): jobs.start(data, value)
+                            if expire:
+                                jobs.sessions[sid]["seen"] = time.monotonic() - 1801
+                                with self.assertRaises(s.ValidationError): jobs.session(sid)
+                            else: jobs.cancel(job_id, sid)
+                            self.assertTrue(finished.wait(3))
+                            job["process"].join(1)
+                            self.assertFalse(job["process"].is_alive())
+                            self.assertNotIn(job_id, jobs.jobs)
+                            self.assertEqual(job["state"], "pending")
+                    finally:
+                        # A terminated process may leave an Event lock held; never
+                        # touch its barrier after termination. Closing Jobs kills it.
+                        jobs.close()
+
+
+class ContainerSmokeChecks(unittest.TestCase):
+    def test_both_initial_and_followup_solve_must_be_useful_within_45_seconds(self):
+        spec = importlib.util.spec_from_file_location("container_smoke", server.ROOT / "tests/check_container.py")
+        smoke = importlib.util.module_from_spec(spec); spec.loader.exec_module(smoke)
+        for elapsed, second_checked, succeeds in ((25, True, True), (44.999, True, True), (45, True, False), (25, False, False)):
+            with self.subTest(elapsed=elapsed, second_checked=second_checked):
+                clock, solves, reports, removed = [0], [0], [], []
+                class Connection:
+                    def __init__(self, *args, **kwargs): pass
+                    def request(self, method, path, *args): self.path = path
+                    def getresponse(self):
+                        if self.path == "/health": data = dict(status="ok")
+                        elif self.path == "/api/config": data = dict(hosting="hosted", csrf_token="test", session_id="test")
+                        elif self.path == "/examples/comparison.json": data = example()
+                        elif self.path == "/api/validate": data = {}
+                        elif self.path == "/api/solve":
+                            solves[0] += 1; clock[0] += elapsed; data = dict(job_id=str(solves[0]))
+                        else:
+                            checked = solves[0] == 1 or second_checked
+                            data = dict(state="complete", elapsed_ms=round(elapsed * 1000), candidate=dict(
+                                checked=checked, status="optimal" if checked else "timeout_no_solution",
+                                reason=None if checked else "watchdog_timeout", metrics=dict(total_tardiness=0)))
+                        return Mock(status=202 if self.path == "/api/solve" else 200,
+                                    read=lambda limit: json.dumps(data).encode(), getheader=lambda key: None)
+                    def close(self): pass
+                def docker(*args):
+                    if args[0] == "inspect":
+                        return json.dumps([dict(NetworkSettings={"Ports": {"8080/tcp": [{"HostPort": "12345"}]}},
+                                                Image="test", HostConfig=dict(Memory=268435456, NanoCpus=100000000))])
+                    if args[0] == "exec": return "100" if args[-1].endswith("memory.peak") else "oom 0\noom_kill 0"
+                    if args[0] == "rm": removed.append(args[-1])
+                    return "owned-id"
+                inspected = Mock(returncode=0, stderr="", stdout=json.dumps([dict(Id="owned-id", Config={
+                    "Labels": {"dev.prateekmulye.scheduler-qa": "a" * 32}})]))
+                with patch.object(smoke, "docker", side_effect=docker), patch.object(smoke.subprocess, "run", return_value=inspected), \
+                        patch.object(smoke.http.client, "HTTPConnection", Connection), \
+                        patch.object(smoke.uuid, "uuid4", return_value=Mock(hex="a" * 32)), \
+                        patch.object(smoke.time, "monotonic", side_effect=lambda: clock[0]), \
+                        patch("builtins.print", side_effect=lambda text, **kwargs: reports.append(json.loads(text))):
+                    if succeeds: smoke.main("test-image")
+                    else:
+                        with self.assertRaises(AssertionError): smoke.main("test-image")
+                self.assertEqual(reports[-1]["passed"], succeeds)
+                self.assertEqual(removed, ["owned-id"])
+                if elapsed < 45:
+                    self.assertEqual(solves[0], 2)
+                    self.assertEqual([item["attempt"] for item in reports[-1]["solves"]], ["initial", "followup"])
 
 
 class SchedulerChecks(unittest.TestCase):
@@ -195,7 +452,7 @@ class HTTPChecks(unittest.TestCase):
         status, response = self.request("POST", "/api/solve", request)
         self.assertEqual(status, 202)
         path = "/api/jobs/" + response["job_id"]
-        until = time.monotonic()+14
+        until = time.monotonic()+45
         while time.monotonic() < until:
             _, result = self.request("GET", path)
             if result["state"] == "complete":
@@ -232,30 +489,6 @@ class HTTPChecks(unittest.TestCase):
             self.assertLess(time.monotonic()-started, 6)
         finally:
             stopped.set(); sender.join(1); connection.close()
-
-    def test_busy_cancel_and_timeout_incumbents(self):
-        request, value = self.validated()
-        jobs = self.server.jobs
-        jobs.budget, jobs.grace = 0.1, 0.5
-        for child, expected in ((hung_child, "timeout_no_solution"), (incumbent_child, "feasible")):
-            with patch.object(server, "solve_child", child):
-                job_id = jobs.start(request["input"], value)
-                with self.assertRaises(s.ValidationError):
-                    jobs.start(request["input"], value)
-                until = time.monotonic()+3
-                while jobs.get(job_id, self.sid)["state"] == "pending" and time.monotonic()<until:
-                    time.sleep(0.03)
-                self.assertEqual(jobs.get(job_id, self.sid)["candidate"]["status"], expected)
-                jobs.cancel(job_id, self.sid)
-        with patch.object(server, "solve_child", hung_child):
-            job_id = jobs.start(request["input"], value)
-            process = jobs.jobs[job_id]["process"]
-            jobs.cancel(job_id, self.sid)
-            process.join(2)
-            self.assertFalse(process.is_alive())
-            time.sleep(0.1)
-            self.assertNotIn(job_id, jobs.jobs)
-
 
 class HostedEntrypointChecks(unittest.TestCase):
     def test_native_backend_only_listens_behind_proxy(self):

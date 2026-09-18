@@ -67,8 +67,10 @@ Hosted AI actions send the planning request and relevant inputs or checked facts
 | Scenario | 20 orders, 60 operations, 10 resources, 200 calendar intervals |
 | Horizon | 10,080 integer minutes, or 7 days |
 | Input | 1 MiB; only the version 1 schema and declared fields |
-| Solver | 10-second solve budget; supervised cancellation and timeout |
+| Solver | Up to 30 seconds for startup, then a 10-second solve budget plus 3-second watchdog grace; cleanup uses at most two 1-second joins |
 | Service | 32 sessions, 16 retained jobs, one active solve and one AI action |
+
+The browser stops waiting at 45 seconds, preserves inputs and permits retry. These are configured timeout bounds, not a guaranteed completion time; native hosting performance remains unverified.
 
 Operations use one fixed resource and must fit entirely within one availability interval. They cannot span breaks. Capacity limits do not promise completion or optimality on every admitted input.
 

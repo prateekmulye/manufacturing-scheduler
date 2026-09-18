@@ -240,10 +240,12 @@ def check_result(scenario, input_tuple, result):
     return safe
 
 
-def solve(scenario, budget=10, on_incumbent=None):
+def solve(scenario, budget=10, on_incumbent=None, on_ready=None):
     """Native solve, called only inside an owned child by the HTTP service."""
     import ortools
     from ortools.sat.python import cp_model
+    if on_ready:
+        on_ready()
     started = time.monotonic()
     h, model = scenario["horizon"], cp_model.CpModel()
     starts, ends = {}, {}
@@ -306,7 +308,7 @@ def solve_child(scenario, connection, budget=10):
     try:
         def send(kind, value):
             connection.send_bytes(json.dumps(dict(kind=kind, value=value), allow_nan=False).encode())
-        send("final", solve(scenario, budget, lambda value: send("incumbent", value)))
+        send("final", solve(scenario, budget, lambda value: send("incumbent", value), lambda: send("ready", None)))
     except Exception:
         try:
             send("final", dict(status="error", reason="solver_failure", assignments=None, engine=None))
