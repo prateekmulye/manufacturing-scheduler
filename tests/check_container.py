@@ -1,6 +1,8 @@
 """Native-runner smoke check at the intended free service limits; no AI calls."""
+import argparse
 import http.client
 import json
+import re
 import subprocess
 import sys
 import time
@@ -17,18 +19,35 @@ def resource_usage(container):
     return dict(peak_memory_bytes=peak, oom=int(events["oom"]), oom_kill=int(events["oom_kill"]))
 
 
-def main(image):
+def import_profile(container):
+    logs = subprocess.run(["docker", "logs", "--tail=1000", container],
+                          text=True, capture_output=True, timeout=25, check=True)
+    pattern = re.compile(r"import time:[ \t]+([0-9]{1,12})[ \t]+\|[ \t]+([0-9]{1,12})[ \t]+\|[ \t]+"
+                         r"([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)")
+    lines = (logs.stdout + "\n" + logs.stderr).splitlines()
+    rows = []
+    for line in lines:
+        match = pattern.fullmatch(line) if len(line) <= 256 else None
+        if match:
+            rows.append(dict(self_us=int(match[1]), cumulative_us=int(match[2]), module=match[3]))
+    return dict(import_time_rows=rows[-200:], import_profile_truncated=len(rows) > 200 or len(lines) >= 1000)
+
+
+def main(image, profile_imports=False):
     owner = uuid.uuid4().hex
     name = "scheduler-check-" + owner[:12]
     label = "dev.prateekmulye.scheduler-qa"
     headers = {"Host": "scheduler.prateekmulye.dev", "Origin": "https://scheduler.prateekmulye.dev"}
     report = {"image": image, "cpu": 0.1, "memory_bytes": 268435456, "model_calls": 0, "passed": False}
+    if profile_imports:
+        report["profiling"] = True
     try:
         docker("run", "-d", "--pull=never", "--name", name, "--memory=256m",
                "--label", label + "=" + owner,
                "--memory-swap=256m", "--cpus=0.1", "--pids-limit=128",
                "--security-opt=no-new-privileges", "--publish", "127.0.0.1::8080",
-               "--env", "AI_GATEWAY_SECRET=" + "unused_test_credential_" + "a" * 43, image)
+               "--env", "AI_GATEWAY_SECRET=" + "unused_test_credential_" + "a" * 43,
+               *(["--env", "PYTHONPROFILEIMPORTTIME=1"] if profile_imports else []), image)
         config = json.loads(docker("inspect", name))[0]
         port = int(config["NetworkSettings"]["Ports"]["8080/tcp"][0]["HostPort"])
         report["image_id"] = config["Image"]
@@ -102,6 +121,11 @@ def main(image):
                         report.update(resource_usage(container["Id"]))
                     except Exception:
                         report["resource_diagnostics"] = "unavailable"
+                if profile_imports:
+                    try:
+                        report.update(import_profile(container["Id"]))
+                    except Exception:
+                        report["import_profile"] = "unavailable"
                 # Remove the inspected immutable ID, never a potentially reused name.
                 docker("rm", "--force", container["Id"])
             elif "No such container" not in inspected.stderr:
@@ -116,4 +140,8 @@ def main(image):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("image")
+    parser.add_argument("--profile-imports", action="store_true")
+    args = parser.parse_args()
+    main(args.image, args.profile_imports)

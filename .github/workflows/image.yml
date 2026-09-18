@@ -3,6 +3,12 @@ name: Publish reviewed image
 # Manual publication only. Review the selected commit before dispatching.
 on:
   workflow_dispatch:
+    inputs:
+      import_profile:
+        description: Profile Python imports without publishing an image
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -38,9 +44,16 @@ jobs:
 
       - name: Verify useful scheduling under free service limits
         shell: bash
-        run: python3 -B tests/check_container.py "$IMAGE:$GITHUB_SHA"
+        env:
+          IMPORT_PROFILE: ${{ inputs.import_profile }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ "$IMPORT_PROFILE" == true ]]; then args+=(--profile-imports); fi
+          python3 -B tests/check_container.py "$IMAGE:$GITHUB_SHA" "${args[@]}"
 
       - name: Publish commit tag and report immutable digest
+        if: ${{ success() && !inputs.import_profile }}
         shell: bash
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
